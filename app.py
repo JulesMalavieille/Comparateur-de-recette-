@@ -7,7 +7,41 @@ Created on Tue Sep 15 18:42:45 2026
     
 import streamlit as st
 import pandas as pd 
+import re
 import io 
+from datetime import datetime
+
+
+FUNCTIONAL_CLASSES = {
+    "acidifiant": "acidifiant",
+    "acidifiants": "acidifiant",
+
+    "humectant": "humectant",
+    "humectants": "humectant",
+
+    "émulsifiant": "émulsifiant",
+    "émulsifiants": "émulsifiant",
+
+    "colorant": "colorant",
+    "colorants": "colorant",
+
+    "gélifiant": "gélifiant",
+    "gélifiants": "gélifiant",
+
+    "conservateur": "conservateur",
+    "conservateurs": "conservateur",
+
+    "antioxydant": "antioxydant",
+    "antioxydants": "antioxydant",
+
+    "édulcorant": "édulcorant",
+    "édulcorants": "édulcorant",
+
+    "correcteur d'acidité": "correcteur d'acidité",
+    "correcteurs d'acidité": "correcteur d'acidité",
+
+    "agent d'enrobage": "agent d'enrobage",
+    "agents d'enrobage": "agent d'enrobage"}
 
 
 # =========================================================
@@ -26,7 +60,55 @@ st.markdown("""<style>.block-container {max-width: 1200px; padding-top: 2rem; pa
 # FONCTIONS
 # =========================================================
 
-def split_ingredients(text):
+def clean_text(text):
+
+    text = re.sub(
+        r"^\s*ingr[eé]dients?\s*:\s*",
+        "",
+        text,
+        flags=re.IGNORECASE)
+
+    return text.strip()
+
+
+
+def detect_separator(text):
+
+    depth = 0
+
+    for char in text:
+
+        if char == "(":
+            depth += 1
+
+        elif char == ")":
+            depth -= 1
+
+        elif char == ";" and depth == 0:
+            return ";"
+
+    return ","
+
+
+
+def comparison_key(ingredient):
+
+    if ":" not in ingredient:
+        return ingredient
+
+    category, content = ingredient.split(":", 1)
+
+    category_clean = category.strip().lower()
+
+    if category_clean in FUNCTIONAL_CLASSES:
+        category_clean = FUNCTIONAL_CLASSES[category_clean]
+
+    return f"{category_clean} : {content.strip()}"
+
+
+
+def split_ingredients(text, separator):
+
     ingredients = []
     element = ""
     depth = 0
@@ -39,15 +121,76 @@ def split_ingredients(text):
         elif char == ")":
             depth -= 1
 
-        if char == "," or char == ";" and depth == 0:
-            ingredients.append(element.strip())
+        if char == separator and depth == 0:
+
+            if element.strip():
+                ingredients.append(element.strip())
+
             element = ""
 
         else:
             element += char
 
-    if element:
+    if element.strip():
         ingredients.append(element.strip())
+
+    return ingredients
+
+
+
+def prepare_ingredients(text):
+
+    text = clean_text(text)
+
+    separator = detect_separator(text)
+
+    blocks = split_ingredients(text, separator)
+
+    ingredients = []
+
+    for block in blocks:
+
+        # Cas d'une catégorie fonctionnelle
+        if ":" in block:
+
+            category, content = block.split(":", 1)
+
+            category_clean = category.strip().lower()
+
+            if category_clean in FUNCTIONAL_CLASSES:
+
+                category_key = FUNCTIONAL_CLASSES[
+                    category_clean]
+
+                # Si la recette utilise ;
+                # les éléments de la catégorie sont
+                # généralement séparés par des virgules
+                subingredients = split_ingredients(
+                    content,
+                    ",")
+
+                for subingredient in subingredients:
+
+                    subingredient = subingredient.strip()
+
+                    ingredients.append({
+                        "key": (
+                            "functional",
+                            category_key,
+                            subingredient
+                        ),
+                        "display": subingredient
+                    })
+
+                continue
+
+        # Ingrédient classique
+        ingredients.append({
+            "key": (
+                "ingredient",
+                block
+            ),
+            "display": block})
 
     return ingredients
 
@@ -55,62 +198,243 @@ def split_ingredients(text):
 
 def compare_recipes(textA, textB):
 
-    A = split_ingredients(textA)
-    B = split_ingredients(textB)
+    A = prepare_ingredients(textA)
+    B = prepare_ingredients(textB)
 
-    removed = [ingredient for ingredient in A if ingredient not in B]
+    keys_A = [ingredient["key"] for ingredient in A]
+    keys_B = [ingredient["key"] for ingredient in B]
 
-    added = [ingredient for ingredient in B if ingredient not in A]
+    removed = [
+        ingredient["display"]
+        for ingredient in A
+        if ingredient["key"] not in keys_B]
 
-    unchanged = [ingredient for ingredient in A if ingredient in B]
+    added = [
+        ingredient["display"]
+        for ingredient in B
+        if ingredient["key"] not in keys_A]
+
+    unchanged = [
+        ingredient["display"]
+        for ingredient in A
+        if ingredient["key"] in keys_B]
 
     return removed, added, unchanged
 
 
-def create_excel(textA, textB, removed, added, unchanged):
 
-    max_len = max(len(removed), len(added), len(unchanged))
+def clear_recipes():
+    st.session_state["recipe_a"] = ""
+    st.session_state["recipe_b"] = ""
+
+
+
+def create_excel(nameA, nameB, textA, textB, removed, added, unchanged):
+
+    # -----------------------------------------------------
+    # Mise à la même longueur des 3 listes
+    # -----------------------------------------------------
+
+    max_len = max(len(removed), len(added), len(unchanged), 1)
 
     removed_col = removed + [""] * (max_len - len(removed))
     added_col = added + [""] * (max_len - len(added))
     unchanged_col = unchanged + [""] * (max_len - len(unchanged))
 
     df_results = pd.DataFrame({
-        "Retiré": removed_col,
-        "Ajouté": added_col,
-        "Inchangé": unchanged_col
+        "Retirés": removed_col,
+        "Ajoutés": added_col,
+        "Inchangés": unchanged_col
     })
 
-    df_recipes = pd.DataFrame({
-        "Recette A": [textA],
-        "Recette B": [textB]
-    })
+    # -----------------------------------------------------
+    # Création du fichier Excel en mémoire
+    # -----------------------------------------------------
 
     output = io.BytesIO()
 
     with pd.ExcelWriter(output, engine="xlsxwriter") as writer:
 
-        df_results.to_excel(
-            writer,
-            sheet_name="Comparaison",
-            index=False
+        workbook = writer.book
+
+        # =================================================
+        # FORMATS
+        # =================================================
+
+        title_format = workbook.add_format({
+            "bold": True,
+            "font_size": 18,
+            "align": "left",
+            "valign": "vcenter",
+            "font_color": "#1E2925"
+        })
+
+        subtitle_format = workbook.add_format({
+            "font_size": 10,
+            "font_color": "#6B7470"
+        })
+
+        label_format = workbook.add_format({
+            "bold": True,
+            "font_color": "#1E2925"
+        })
+
+        value_format = workbook.add_format({
+            "font_color": "#1E2925"
+        })
+
+        removed_header = workbook.add_format({
+            "bold": True,
+            "align": "center",
+            "valign": "vcenter",
+            "bg_color": "#F4CCCC",
+            "font_color": "#8A1C1C",
+            "border": 1
+        })
+
+        added_header = workbook.add_format({
+            "bold": True,
+            "align": "center",
+            "valign": "vcenter",
+            "bg_color": "#D9EAD3",
+            "font_color": "#1F6F43",
+            "border": 1
+        })
+
+        unchanged_header = workbook.add_format({
+            "bold": True,
+            "align": "center",
+            "valign": "vcenter",
+            "bg_color": "#E7E7E7",
+            "font_color": "#555555",
+            "border": 1
+        })
+
+        removed_cell = workbook.add_format({
+            "bg_color": "#FCE8E8",
+            "border": 1,
+            "valign": "top",
+            "text_wrap": True
+        })
+
+        added_cell = workbook.add_format({
+            "bg_color": "#EAF4E7",
+            "border": 1,
+            "valign": "top",
+            "text_wrap": True
+        })
+
+        unchanged_cell = workbook.add_format({
+            "bg_color": "#F3F3F3",
+            "border": 1,
+            "valign": "top",
+            "text_wrap": True
+        })
+
+        source_header = workbook.add_format({
+            "bold": True,
+            "bg_color": "#D9E2DD",
+            "border": 1,
+            "align": "center"
+        })
+
+        source_cell = workbook.add_format({
+            "border": 1,
+            "valign": "top",
+            "text_wrap": True
+        })
+
+
+        # =================================================
+        # FEUILLE 1 : COMPARAISON
+        # =================================================
+
+        worksheet = workbook.add_worksheet("Comparaison")
+
+        # Titre
+        worksheet.merge_range(
+            "A1:C1",
+            "Comparaison de recettes",
+            title_format
         )
 
-        df_recipes.to_excel(
-            writer,
-            sheet_name="Recettes",
-            index=False
+        worksheet.write(
+            "A2",
+            f"Rapport généré le {datetime.now().strftime('%d/%m/%Y à %H:%M')}",
+            subtitle_format
         )
 
-        worksheet_results = writer.sheets["Comparaison"]
-        worksheet_results.set_column("A:C", 50)
+        # Informations sur les recettes
+        worksheet.write("A4", "Recette initiale :", label_format)
+        worksheet.write("B4", nameA, value_format)
 
-        worksheet_recipes = writer.sheets["Recettes"]
-        worksheet_recipes.set_column("A:B", 80)
+        worksheet.write("A5", "Nouvelle recette :", label_format)
+        worksheet.write("B5", nameB, value_format)
+
+        # Résumé chiffré
+        worksheet.write("A7", f"Retirés : {len(removed)}", removed_header)
+        worksheet.write("B7", f"Ajoutés : {len(added)}", added_header)
+        worksheet.write("C7", f"Inchangés : {len(unchanged)}", unchanged_header)
+
+        # Titres des colonnes
+        worksheet.write("A9", "RETIRÉS", removed_header)
+        worksheet.write("B9", "AJOUTÉS", added_header)
+        worksheet.write("C9", "INCHANGÉS", unchanged_header)
+
+        # Données
+        for row, ingredient in enumerate(removed_col, start=9):
+            worksheet.write(row, 0, ingredient, removed_cell)
+
+        for row, ingredient in enumerate(added_col, start=9):
+            worksheet.write(row, 1, ingredient, added_cell)
+
+        for row, ingredient in enumerate(unchanged_col, start=9):
+            worksheet.write(row, 2, ingredient, unchanged_cell)
+
+        # Largeurs
+        worksheet.set_column("A:C", 45)
+
+        # Hauteur de la ligne du titre
+        worksheet.set_row(0, 28)
+
+        # Figer le haut de la liste
+        worksheet.freeze_panes(9, 0)
+
+        # Masquer le quadrillage Excel
+        worksheet.hide_gridlines(2)
+
+
+        # =================================================
+        # FEUILLE 2 : RECETTES SOURCES
+        # =================================================
+
+        source_sheet = workbook.add_worksheet("Recettes sources")
+
+        source_sheet.merge_range(
+            "A1:B1",
+            "Recettes originales",
+            title_format
+        )
+
+        source_sheet.write("A3", nameA, source_header)
+        source_sheet.write("B3", nameB, source_header)
+
+        source_sheet.write("A4", textA, source_cell)
+        source_sheet.write("B4", textB, source_cell)
+
+        source_sheet.set_column("A:B", 70)
+
+        # Grande hauteur pour lire les recettes
+        source_sheet.set_row(3, 120)
+
+        source_sheet.hide_gridlines(2)
+
 
     output.seek(0)
 
     return output
+
+
 
 
 # =========================================================
@@ -140,11 +464,28 @@ if st.button("Charger un exemple"):
         "tomates 61%, fromage (lait, sel, vinaigre), "
         "sucre, correcteur d'acidité : acide citrique, basilic")
     
+    
+# =========================================================
+# BOUTON VIDER
+# =========================================================
+st.button(
+    "Vider les recettes",
+    on_click=clear_recipes,
+    icon=":material/delete:")
+    
 
 
 # =========================================================
 # ZONES DE TEXTE
 # =========================================================
+nameA = st.text_input(
+    "Nom de la recette A",
+    value="Recette A")
+
+nameB = st.text_input(
+    "Nom de la recette B",
+    value="Recette B")
+
 
 colA, colB = st.columns(2, gap="large")
 
@@ -153,11 +494,11 @@ with colA:
 
     with st.container(border=True):
 
-        st.markdown("### Recette A")
+        st.markdown(f"### {nameA}")
         st.caption("Version initiale")
 
         textA = st.text_area(
-            "Recette A",
+            nameA,
             height=250,
             placeholder="Collez la première liste d'ingrédients...",
             label_visibility="collapsed", 
@@ -168,11 +509,11 @@ with colB:
 
     with st.container(border=True):
 
-        st.markdown("### Recette B")
+        st.markdown(f"### {nameB}")
         st.caption("Nouvelle version")
 
         textB = st.text_area(
-            "Recette B",
+            nameB,
             height=250,
             placeholder="Collez la deuxième liste d'ingrédients...",
             label_visibility="collapsed", 
@@ -207,12 +548,38 @@ if compare:
     else:
 
         removed, added, unchanged = compare_recipes(textA, textB)
+
         excel_file = create_excel(
+            nameA,
+            nameB,
             textA,
             textB,
             removed,
             added,
             unchanged)
+
+        # ---------------------------------------------
+        # DESCENDRE AUTOMATIQUEMENT AUX RÉSULTATS
+        # ---------------------------------------------
+
+        st.html(
+            """
+            <div id="resultats"></div>
+
+            <script>
+                setTimeout(() => {
+                    const element = document.getElementById("resultats");
+
+                    if (element) {
+                        element.scrollIntoView({
+                            behavior: "smooth",
+                            block: "start"
+                        });
+                    }
+                }, 200);
+            </script>
+            """,
+            unsafe_allow_javascript=True)
 
         st.divider()
 
