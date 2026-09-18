@@ -39,7 +39,7 @@ def split_ingredients(text):
         elif char == ")":
             depth -= 1
 
-        if char == "," and depth == 0:
+        if char == "," or char == ";" and depth == 0:
             ingredients.append(element.strip())
             element = ""
 
